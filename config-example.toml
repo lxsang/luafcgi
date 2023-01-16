@@ -1,10 +1,12 @@
 # TCP socket or Unix socket file
-socket = "unix:/tmp/lua.sock"
+socket = "unix:/tmp/lua1.sock"
 
 # pid file
 pidfile = "/tmp/luad.pid"
 
 # user name
-# user = "demo"
+user = "dany"
 # group name
-# group = "demo"
+group = "dany"
+
+debug = false
