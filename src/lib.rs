@@ -541,7 +541,8 @@ impl mlua::UserData for FCGIOStream {
 }
 
 fn fcgi_execute_request_handle(rq: &mut FGCIRequest) -> Result<(), Box<dyn std::error::Error>> {
-    let lua = mlua::Lua::new();
+    let lua = unsafe { mlua::Lua::unsafe_new() };
+    lua.load_from_std_lib(mlua::StdLib::ALL)?;
     let global = lua.globals();
     let request = lua.create_table()?;
 
@@ -836,6 +837,8 @@ impl mlua::UserData for LuabyteArray {
     fn add_methods<'lua, M: mlua::UserDataMethods<'lua, Self>>(methods: &mut M) {
         methods.add_method("size", |_, this: &LuabyteArray, ()| Ok(this.0.len()));
 
+        methods.add_method("ptr", |_, this:&LuabyteArray, ()| Ok(this.0.as_ptr() as usize));
+
         methods.add_method("write", |_, this: &LuabyteArray, path: String| {
             match std::fs::File::create(&path) {
                 Ok(mut file) => {
@@ -892,6 +895,6 @@ impl mlua::UserData for LuabyteArray {
                 Ok(())
             },
         );
-        methods.add_meta_method_mut(mlua::MetaMethod::Len, |_, this, ()| Ok(this.0.len()));
+        methods.add_meta_method(mlua::MetaMethod::Len, |_, this, ()| Ok(this.0.len()));
     }
 }
