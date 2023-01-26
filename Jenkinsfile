@@ -7,20 +7,8 @@ def build_luad() {
     cd $WORKSPACE
     mkdir -p build/$arch/opt/www/bin
     DESTDIR=$WORKSPACE/build/$arch/opt/www/bin
-    target="x86_64-unknown-linux-gnu"
-    case $arch in
-        arm64)
-            target="aarch64-unknown-linux-gnu"
-            ;;
-
-        arm)
-            target="armv7-unknown-linux-gnueabihf"
-            ;;
-        *)
-            ;;
-    esac
     cargo build --release
-    cp $target/release/luad $DESTDIR
+    cp target/release/luad $DESTDIR
   '''
 }
 
