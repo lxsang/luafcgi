@@ -56,7 +56,7 @@ fn handle_request<T: Read + Write + AsRawFd>(stream: &mut T) {
     if let Err(error) = process_request(stream) {
         ERROR!("Unable to process request: {}", error);
     }
-    INFO!("Request on socket {} is processed", stream.as_raw_fd());
+    DEBUG!("Request on socket {} is processed", stream.as_raw_fd());
 }
 
 /// Start the `fastCGI` server
@@ -94,11 +94,11 @@ fn serve(config: &Config) {
     } else {
         // if there is no socket configuration, assume that the stdio is already mapped
         // to a socket. This is usually done by by the parent process (e.g. webserver) that launches efcgi
-        INFO!("No socket specified! use stdin as listenning socket");
+        INFO!("No socket specified! use stdin as listening socket");
         let stdin = std::io::stdin();
         let fd = stdin.as_raw_fd();
         if is_unix_socket(fd).unwrap() {
-            INFO!("Stdin is used as Unix domain socket");
+            DEBUG!("Stdin is used as Unix domain socket");
             let listener = unsafe { UnixListener::from_raw_fd(stdin.as_raw_fd()) };
             for client in listener.incoming() {
                 let mut stream = client.unwrap();
@@ -108,7 +108,7 @@ fn serve(config: &Config) {
                 });
             }
         } else {
-            INFO!("Stdin is used as TCP Socket");
+            DEBUG!("Stdin is used as TCP Socket");
             let listener = unsafe { TcpListener::from_raw_fd(stdin.as_raw_fd()) };
             for client in listener.incoming() {
                 let mut stream = client.unwrap();
@@ -174,7 +174,7 @@ fn main() {
                 Some(pidfile) => {
                     let mut f = std::fs::File::create(&pidfile).unwrap();
                     write!(f, "{}", std::process::id()).unwrap();
-                    INFO!("PID file created at {}", pidfile);
+                    DEBUG!("PID file created at {}", pidfile);
                 }
                 None => {}
             }

@@ -1,10 +1,9 @@
-use libc;
 use mlua::prelude::*;
 use nix;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt::Arguments;
-use std::io::{Error, ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, Error, ErrorKind, Read, Write};
 use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
 
@@ -16,6 +15,8 @@ pub const APP_VERSION: &str = "0.1.0";
 
 /// Application name
 pub const DAEMON_NAME: &str = "luad";
+
+const LUA_SLICE_MAGIC: usize = 0x8AD73B9F;
 
 fn is_debug_enable() -> bool {
     match std::env::var("debug") {
@@ -136,6 +137,16 @@ macro_rules! ERROR {
     })
 }
 
+/// Macro for info log debug
+///
+#[macro_export]
+macro_rules! DEBUG {
+    ($($args:tt)*) => ({
+        let prefix = format!(":debug@[{}:{}]: ",file!(), line!());
+        let _ = LOG::log(&prefix[..], &LogLevel::DEBUG, format_args!($($args)*));
+    })
+}
+
 /// Different Logging levels for `LOG`
 pub enum LogLevel {
     /// Error conditions
@@ -144,6 +155,8 @@ pub enum LogLevel {
     INFO,
     /// Warning conditions
     WARN,
+    /// Debugs message
+    DEBUG,
 }
 
 /// Log struct wrapper
@@ -188,11 +201,12 @@ impl LOG {
         let sysloglevel = match level {
             LogLevel::ERROR => libc::LOG_ERR,
             LogLevel::WARN => libc::LOG_WARNING,
+            LogLevel::INFO => libc::LOG_NOTICE,
             _ => {
                 if !is_debug_enable() {
                     return Ok(());
                 }
-                libc::LOG_NOTICE
+                libc::LOG_INFO
             }
         };
         let mut output = String::new();
@@ -450,7 +464,7 @@ struct FGCIRequest {
     data: Option<Vec<u8>>,
     state: FCGIRequestState,
 }
-
+#[repr(C)]
 struct FCGIOStream {
     fd: RawFd,
     id: u16,
@@ -468,7 +482,7 @@ impl FCGIOStream {
         let mut output: Vec<u8> = Vec::new();
 
         for value in values {
-            match value {
+            match &value {
                 LuaNil => {}
                 LuaValue::Boolean(v) => output.extend(v.to_string().as_bytes()),
                 LuaValue::Integer(v) => output.extend(v.to_string().as_bytes()),
@@ -481,11 +495,18 @@ impl FCGIOStream {
                     return Err(Box::new(ERR!("Unsupported data type")));
                 }
                 LuaValue::UserData(v) => {
-                    if !v.is::<LuabyteArray>() {
-                        return Err(Box::new(ERR!("Unsupported data type")));
+                    if v.is::<LuabyteArray>() {
+                        let arr = v.borrow::<LuabyteArray>()?;
+                        output.extend(&arr.0);
+                    } else {
+                        let st = value.to_pointer() as *const LuaSlice;
+                        if unsafe { (*st).magic } != LUA_SLICE_MAGIC {
+                            return Err(Box::new(ERR!("Unsupported data type")));
+                        }
+                        let data_slice =
+                            unsafe { std::slice::from_raw_parts((*st).data, (*st).len) };
+                        output.extend(data_slice);
                     }
-                    let arr = v.borrow::<LuabyteArray>()?;
-                    output.extend(arr.0.clone());
                 }
                 LuaValue::Error(e) => {
                     fcgi_send_stderr(self, self.id, Some(e.to_string().into()))?;
@@ -528,6 +549,24 @@ impl mlua::UserData for FCGIOStream {
                     .map_err(|e| mlua::Error::external(ERR!(e.to_string())))
             },
         );
+        methods.add_method_mut("send_file", |_, this: &mut FCGIOStream, path: String| {
+            let file = std::fs::File::open(path)?;
+            let mut buf_reader = BufReader::with_capacity(2048, file);
+            loop {
+                let length = {
+                    let buffer = buf_reader.fill_buf()?;
+                    fcgi_send_stdout(this, this.id, Some(buffer.to_vec()))
+                        .map_err(|e| mlua::Error::external(ERR!(e.to_string())))?;
+                    buffer.len()
+                };
+                if length == 0 {
+                    break;
+                }
+                buf_reader.consume(length);
+            }
+            Ok(())
+        });
+
         methods.add_method_mut(
             "print",
             |_, this: &mut FCGIOStream, values: mlua::Variadic<_>| {
@@ -535,8 +574,24 @@ impl mlua::UserData for FCGIOStream {
                     .map_err(|e| mlua::Error::external(ERR!(e.to_string())))
             },
         );
-        methods.add_method("raw_fd", |_, this: &FCGIOStream, ()| Ok(this.fd));
+        methods.add_method("fd", |_, this: &FCGIOStream, ()| Ok(this.fd));
         methods.add_method("id", |_, this: &FCGIOStream, ()| Ok(this.id));
+        methods.add_method("log_info", |_, _: &FCGIOStream, string: String| {
+            INFO!("{}", string);
+            Ok(())
+        });
+        methods.add_method("log_error", |_, _: &FCGIOStream, string: String| {
+            ERROR!("{}", string);
+            Ok(())
+        });
+        methods.add_method("log_debug", |_, _: &FCGIOStream, string: String| {
+            DEBUG!("{}", string);
+            Ok(())
+        });
+        methods.add_method("log_warn", |_, _: &FCGIOStream, string: String| {
+            WARN!("{}", string);
+            Ok(())
+        });
     }
 }
 
@@ -569,7 +624,9 @@ fn fcgi_execute_request_handle(rq: &mut FGCIRequest) -> Result<(), Box<dyn std::
         "from_string",
         lua.create_function(lua_new_bytes_from_string)?,
     )?;
+
     bytes.set("new", lua.create_function(lua_new_bytes)?)?;
+    bytes.set("from_slice", lua.create_function(lua_new_from_slice)?)?;
     global.set("bytes", bytes)?;
 
     let path = rq
@@ -669,7 +726,7 @@ pub fn process_request<T: Read + Write + AsRawFd>(
         match header.kind {
             FCGIHeaderType::BeginRequest => {
                 let body = FCGIBeginRequestBody::from_bytes(&fcgi_read_body(stream, &header)?);
-                INFO!("Begin Request: {:?}, with body {:?}", header, body);
+                DEBUG!("Begin Request: {:?}, with body {:?}", header, body);
                 if body.role != FCGIRole::Responder {
                     fcgi_send_end_request(stream, header.id, EndRequestStatus::UnknownRole)?;
                     return Err(Box::new(ERR!("Only Responder role is supported")));
@@ -697,7 +754,7 @@ pub fn process_request<T: Read + Write + AsRawFd>(
                         );
                     } else {
                         if header.length == 0 {
-                            INFO!(
+                            DEBUG!(
                                 "All param records read, now wait for stdin data on request: {}",
                                 header.id
                             );
@@ -719,7 +776,7 @@ pub fn process_request<T: Read + Write + AsRawFd>(
                         );
                     } else {
                         if header.length == 0 {
-                            INFO!(
+                            DEBUG!(
                                 "All stdin records read, now wait for stdout data on request: {}",
                                 header.id
                             );
@@ -816,7 +873,7 @@ fn fcgi_decode_params(
     let key = String::from_utf8(data[index..index + key_len].to_vec())?;
     let value: String =
         String::from_utf8(data[index + key_len..index + key_len + value_len].to_vec())?;
-    INFO!("PARAM: [{}] -> [{}]", key, value);
+    DEBUG!("PARAM: [{}] -> [{}]", key, value);
     let _ = rq.params.insert(key, value);
     Ok(())
 }
@@ -824,6 +881,15 @@ fn fcgi_decode_params(
 fn lua_new_bytes(_: &mlua::Lua, size: usize) -> LuaResult<LuabyteArray> {
     let arr = LuabyteArray(vec![0; size]);
     Ok(arr)
+}
+
+fn lua_new_from_slice(_: &mlua::Lua, value: mlua::Value) -> LuaResult<LuabyteArray> {
+    let st = value.to_pointer() as *const LuaSlice;
+    if unsafe { (*st).magic } != LUA_SLICE_MAGIC {
+        return Err(mlua::Error::external(ERR!("Unsupported data type")));
+    }
+    let data_slice = unsafe { std::slice::from_raw_parts((*st).data, (*st).len) };
+    Ok(LuabyteArray(data_slice.to_vec()))
 }
 
 fn lua_new_bytes_from_string(_: &mlua::Lua, string: String) -> LuaResult<LuabyteArray> {
@@ -837,9 +903,11 @@ impl mlua::UserData for LuabyteArray {
     fn add_methods<'lua, M: mlua::UserDataMethods<'lua, Self>>(methods: &mut M) {
         methods.add_method("size", |_, this: &LuabyteArray, ()| Ok(this.0.len()));
 
-        methods.add_method("ptr", |_, this:&LuabyteArray, ()| Ok(this.0.as_ptr() as usize));
+        methods.add_method("ptr", |_, this: &LuabyteArray, ()| {
+            Ok(this.0.as_ptr() as usize)
+        });
 
-        methods.add_method("write", |_, this: &LuabyteArray, path: String| {
+        methods.add_method("fileout", |_, this: &LuabyteArray, path: String| {
             match std::fs::File::create(&path) {
                 Ok(mut file) => {
                     if let Err(error) = file.write_all(&this.0) {
@@ -878,7 +946,6 @@ impl mlua::UserData for LuabyteArray {
                 Ok(string) => Ok(Some(string)),
             },
         );
-
         methods.add_meta_method_mut(
             mlua::MetaMethod::NewIndex,
             |_, this, (index, value): (isize, u8)| {
@@ -897,4 +964,28 @@ impl mlua::UserData for LuabyteArray {
         );
         methods.add_meta_method(mlua::MetaMethod::Len, |_, this, ()| Ok(this.0.len()));
     }
+}
+
+#[repr(C)]
+pub struct LuaSlice {
+    magic: usize,
+    len: usize,
+    data: *const u8,
+}
+
+#[no_mangle]
+pub extern "C" fn fcgi_send_slice(fd: RawFd, id: u16, ptr: *const u8, size: usize) -> isize {
+    let data_slice = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
+    let mut stream = FCGIOStream { fd, id };
+
+    if let Err(error) = fcgi_send_stdout(&mut stream, id, Some(data_slice)) {
+        ERROR!("Unable to send data slice: {}", error);
+        return -1;
+    }
+    return 0;
+}
+
+#[no_mangle]
+pub extern "C" fn lua_slice_magic() -> usize {
+    return LUA_SLICE_MAGIC;
 }
