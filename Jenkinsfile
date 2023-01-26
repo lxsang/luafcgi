@@ -1,10 +1,9 @@
 def build_luad() {
     sh '''
     set -e
-    echo $HOME
-    export RUSTUP_HOME=$HOME/.rustup/
-    export CARGO_HOME=$HOME/.cargo/
-    . $HOME/.cargo/env
+    export RUSTUP_HOME=/root/.rustup/
+    export CARGO_HOME=/root/.cargo/
+    . /root/.cargo/env
     cd $WORKSPACE
     mkdir -p build/$arch/opt/www/bin
     DESTDIR=$WORKSPACE/build/$arch/opt/www/bin
