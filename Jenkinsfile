@@ -1,5 +1,5 @@
 def build_luad() {
-    sh '''
+    sh '''#!/bin/bash
     set -e
     export RUSTUP_HOME=/root/.rustup/
     export CARGO_HOME=/root/.cargo/
