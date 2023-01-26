@@ -3,25 +3,29 @@
 
 def build_luad() {
     sh '''
-  set -e
-  cd $WORKSPACE
-  mkdir -p build/$arch/opt/www/bin
-  DESTDIR=$WORKSPACE/build/$arch/opt/www/bin
-  target="x86_64-unknown-linux-gnu"
-  case $arch in
-    arm64)
-        target="aarch64-unknown-linux-gnu"
-        ;;
+    set -e
+    echo $HOME
+    export RUSTUP_HOME=$HOME/.rustup/
+    export CARGO_HOME=$HOME/.cargo/
+    source $HOME/.cargo/env
+    cd $WORKSPACE
+    mkdir -p build/$arch/opt/www/bin
+    DESTDIR=$WORKSPACE/build/$arch/opt/www/bin
+    target="x86_64-unknown-linux-gnu"
+    case $arch in
+        arm64)
+            target="aarch64-unknown-linux-gnu"
+            ;;
 
-    arm)
-        target="armv7-unknown-linux-gnueabihf"
-        ;;
-    *)
-        ;;
-    esac
-    cargo build --target=$target --release
-    file target/release/luad
-  '''
+        arm)
+            target="armv7-unknown-linux-gnueabihf"
+            ;;
+        *)
+            ;;
+        esac
+        cargo build --target=$target --release
+        file target/release/luad
+    '''
 }
 
 pipeline {
