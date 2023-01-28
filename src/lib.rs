@@ -7,6 +7,9 @@ use std::fmt::Arguments;
 use std::io::{BufRead, BufReader, Error, ErrorKind, Read, Write};
 use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
+use std::time::SystemTime;
+use twoway;
+
 /// app author
 pub const APP_AUTHOR: &str = "Dany LE <mrsang@iohub.dev>";
 
@@ -15,15 +18,30 @@ pub const APP_VERSION: &str = "0.1.0";
 
 /// Application name
 pub const DAEMON_NAME: &str = "luad";
-
+/// Magic number for lua slice structure
 const LUA_SLICE_MAGIC: usize = 0x8AD73B9F;
+/// FastCGI frame header len
+const FCGI_HEADER_LEN: usize = 8;
+/// FastCGI protocol version
+const FCGI_VERSION: u8 = 1;
+/// Temporal location for file upload
+const TMP_DIR: &str = "/tmp";
 
-fn is_debug_enable() -> bool {
-    match std::env::var("debug") {
-        Ok(value) => return value == "1" || value == "true",
-        Err(_) => {}
-    }
-    false
+/// LOG_MASK is used to create the priority mask in setlogmask
+/// For a mask UPTO specified
+/// used with [Priority]
+///
+/// # Examples
+///
+/// ```
+///     LOG_UPTO!(Priority::LOG_ALERT)
+/// ```
+#[macro_export]
+macro_rules! LOG_UPTO
+{
+    ($($arg:tt)*) => (
+        ((1 << (($($arg)*) + 1)) - 1)
+    )
 }
 
 /// Drop user privileges
@@ -187,8 +205,16 @@ impl LOG {
                 libc::LOG_CONS | libc::LOG_PID | libc::LOG_NDELAY,
                 libc::LOG_DAEMON,
             );
+            libc::setlogmask(LOG_UPTO!(libc::LOG_NOTICE));
         }
         Self {}
+    }
+    /// Enable the Log debug
+    ///
+    pub fn enable_debug() {
+        unsafe {
+            libc::setlogmask(LOG_UPTO!(libc::LOG_INFO));
+        }
     }
 
     /// Wrapper function that log error or info message to the
@@ -209,12 +235,7 @@ impl LOG {
             LogLevel::ERROR => libc::LOG_ERR,
             LogLevel::WARN => libc::LOG_WARNING,
             LogLevel::INFO => libc::LOG_NOTICE,
-            _ => {
-                if !is_debug_enable() {
-                    return Ok(());
-                }
-                libc::LOG_INFO
-            }
+            _ => libc::LOG_INFO,
         };
         let mut output = String::new();
         if output.write_fmt(args).is_err() {
@@ -342,9 +363,6 @@ impl EndRequestStatus {
     }
 }
 
-const FCGI_HEADER_LEN: usize = 8;
-const FCGI_VERSION: u8 = 1;
-
 #[derive(Debug, PartialEq)]
 enum FCGIRole {
     Responder,
@@ -449,7 +467,7 @@ impl std::fmt::Display for FcgiHeader {
 #[derive(Debug)]
 enum FCGIRequestState {
     WaitForParams,
-    WaitForStdin,
+    WaitForStdin(FCGIRequestBodyState),
     WaitForStdout,
 }
 
@@ -457,7 +475,7 @@ impl std::fmt::Display for FCGIRequestState {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let s = match self {
             FCGIRequestState::WaitForParams => "WaitForParams",
-            FCGIRequestState::WaitForStdin => "WaitForStdin",
+            FCGIRequestState::WaitForStdin(_) => "WaitForStdin",
             FCGIRequestState::WaitForStdout => "WaitForStdout",
         };
         write!(f, "{}", s)
@@ -465,11 +483,18 @@ impl std::fmt::Display for FCGIRequestState {
 }
 
 struct FGCIRequest {
+    /// FastCGI params
     params: HashMap<String, String>,
+    /// current request ID
     id: u16,
+    /// current request socket
     fd: RawFd,
+    /// Request data buffer
     data: Option<Vec<u8>>,
+    /// current request state
     state: FCGIRequestState,
+    /// pending data length
+    pending_dlen: isize,
 }
 
 #[derive(Debug)]
@@ -541,7 +566,7 @@ impl mlua::UserData for WSHeader {
     }
 }
 impl WSHeader {
-    fn read_from(stream: &mut FCGIOStream) -> Result<WSHeader, Box<dyn std::error::Error>> {
+    fn read_from(stream: &mut FCGIOStream) -> Result<WSHeader, std::io::Error> {
         let mut header = WSHeader {
             fin: 0,
             opcode: WSHeaderOpcode::Close,
@@ -551,7 +576,7 @@ impl WSHeader {
         };
         let mut bytes = stream.stdin_read_exact(2)?;
         if BITV!(bytes[0], 6) == 1 || BITV!(bytes[0], 5) == 1 || BITV!(bytes[0], 4) == 1 {
-            return Err(Box::new(ERR!("Reserved bits 4,5,6 must be 0")));
+            return Err(ERR!("Reserved bits 4,5,6 must be 0"));
         }
         header.fin = BITV!(bytes[0], 7);
         header.opcode = WSHeaderOpcode::from_u8(bytes[0] & 0x0F);
@@ -591,10 +616,7 @@ impl WSHeader {
         Ok(header)
     }
 
-    fn read_data_from(
-        &mut self,
-        stream: &mut FCGIOStream,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    fn read_data_from(&mut self, stream: &mut FCGIOStream) -> Result<Vec<u8>, std::io::Error> {
         let mut vec = stream.stdin_read_exact(self.len)?;
         if self.mask == 1 {
             for i in 0..vec.len() {
@@ -604,11 +626,7 @@ impl WSHeader {
         Ok(vec)
     }
 
-    fn send_to(
-        &mut self,
-        stream: &mut FCGIOStream,
-        data: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn send_to(&mut self, stream: &mut FCGIOStream, data: &[u8]) -> Result<(), std::io::Error> {
         let mut frame: Vec<u8>;
         if self.mask == 1 {
             let mut rng = rand::thread_rng();
@@ -676,7 +694,7 @@ struct FCGIOStream {
 }
 
 impl FCGIOStream {
-    fn read_stdin_record(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn read_stdin_record(&mut self) -> Result<(), std::io::Error> {
         if !self.ws {
             WARN!("read_stdin_record is only active when the current connection is websocket");
             return Ok(());
@@ -697,7 +715,7 @@ impl FCGIOStream {
         Ok(())
     }
 
-    fn stdin_read_exact(&mut self, len: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    fn stdin_read_exact(&mut self, len: usize) -> Result<Vec<u8>, std::io::Error> {
         while self.stdin_buffer.len() < len {
             self.read_stdin_record()?;
         }
@@ -705,7 +723,7 @@ impl FCGIOStream {
         Ok(self.stdin_buffer.drain(0..len).collect::<Vec<u8>>())
     }
 
-    fn write_record(&mut self, buf: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+    fn write_record(&mut self, buf: Vec<u8>) -> Result<(), std::io::Error> {
         fcgi_send_stdout(self, self.id, Some(buf))?;
         Ok(())
     }
@@ -714,9 +732,9 @@ impl FCGIOStream {
 fn vec_from_variadic(
     values: mlua::Variadic<LuaValue>,
     bin_only: bool,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+) -> Result<Vec<u8>, std::io::Error> {
     let mut output: Vec<u8> = Vec::new();
-    let error = Box::new(ERR!("Unsupported data type"));
+    let error = ERR!("Unsupported data type");
     for value in values {
         match &value {
             LuaNil => {}
@@ -749,7 +767,9 @@ fn vec_from_variadic(
             }
             LuaValue::UserData(v) => {
                 if v.is::<LuabyteArray>() {
-                    let arr = v.borrow::<LuabyteArray>()?;
+                    let arr = v
+                        .borrow::<LuabyteArray>()
+                        .map_err(|e| ERR!(e.to_string()))?;
                     output.extend(&arr.0);
                 } else {
                     let st = value.to_pointer() as *const LuaSlice;
@@ -761,7 +781,7 @@ fn vec_from_variadic(
                 }
             }
             LuaValue::Error(e) => {
-                return Err(Box::new(ERR!(e.to_string())));
+                return Err(ERR!(e.to_string()));
             }
         }
     }
@@ -1018,7 +1038,7 @@ fn fcgi_send_stderr<T: Write>(
     stream: &mut T,
     id: u16,
     eopt: Option<Box<dyn std::error::Error>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), std::io::Error> {
     let mut header = FcgiHeader {
         version: FCGI_VERSION,
         kind: FCGIHeaderType::Stderr,
@@ -1050,7 +1070,7 @@ fn fcgi_send_stdout<T: Write>(
     stream: &mut T,
     id: u16,
     dopt: Option<Vec<u8>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), std::io::Error> {
     let mut header = FcgiHeader {
         version: FCGI_VERSION,
         kind: FCGIHeaderType::Stdout,
@@ -1075,11 +1095,11 @@ fn fcgi_send_stdout<T: Write>(
     Ok(())
 }
 
-fn fcgi_send_end_request<T: Read + Write + AsRawFd>(
+fn fcgi_send_end_request<T: Read + Write>(
     stream: &mut T,
     id: u16,
     status: EndRequestStatus,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), std::io::Error> {
     let header = FcgiHeader {
         version: FCGI_VERSION,
         kind: FCGIHeaderType::EndRequest,
@@ -1093,9 +1113,157 @@ fn fcgi_send_end_request<T: Read + Write + AsRawFd>(
     Ok(())
 }
 
-pub fn process_request<T: Read + Write + AsRawFd>(
+#[derive(Debug)]
+struct FCGIFilePart {
+    name: String,
+    tmp_path: String,
+    handle: std::fs::File,
+}
+#[derive(Debug)]
+enum FCGIRequestBodyState {
+    FindBoundary(String),
+    HeaderDecoding(String),
+    DataDecoding {
+        boundary: String,
+        name: String,
+        file: Option<FCGIFilePart>,
+        vec: Vec<u8>,
+    },
+    BinaryData,
+}
+
+fn fcgi_read_stdin<T: Read + Write>(
     stream: &mut T,
-) -> Result<(), Box<dyn std::error::Error>> {
+    rq: &mut FGCIRequest,
+    header: &FcgiHeader,
+) -> Result<bool, Error> {
+    match &mut rq.state {
+        FCGIRequestState::WaitForStdin(body_state) => {
+            if header.length == 0 {
+                match body_state {
+                    FCGIRequestBodyState::BinaryData => {}
+                    __ => {
+                        return Err(ERR!("Invalid body data"));
+                    }
+                }
+                DEBUG!(
+                    "All stdin records read, now wait for stdout data on request: {}",
+                    header.id
+                );
+                rq.state = FCGIRequestState::WaitForStdout;
+                if let Err(error) = fcgi_execute_request_handle(rq) {
+                    // send stderror
+                    fcgi_send_stderr(stream, header.id, Some(error))?;
+                }
+                fcgi_send_stderr(stream, header.id, None)?;
+                fcgi_send_stdout(stream, header.id, None)?;
+                // send end connection
+                fcgi_send_end_request(stream, header.id, EndRequestStatus::Complete)?;
+                return Ok(true);
+            } else {
+                let body = fcgi_read_body(stream, &header)?;
+                rq.pending_dlen -= body.len() as isize;
+                if rq.pending_dlen < 0 {
+                    return Err(ERR!(
+                        "Request body is bigger than request content-length header"
+                    ));
+                }
+                if let None = rq.data {
+                    rq.data = Some(Vec::new());
+                }
+                match rq.data.take() {
+                    Some(mut data) => {
+                        let mut stateopt = None;
+                        data.extend(body);
+                        loop {
+                            let curr_state = match &mut stateopt {
+                                Some(st) => st,
+                                None => body_state,
+                            };
+                            // decode stdin data
+                            match fcgi_decode_stdin_data(curr_state, &mut data, &mut rq.params)? {
+                                Some(st) => {
+                                    stateopt = Some(st);
+                                    if data.len() == 0 {
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(state) = stateopt {
+                            rq.state = FCGIRequestState::WaitForStdin(state);
+                        }
+                        rq.data = if data.len() == 0 { None } else { Some(data) };
+                    }
+                    None => {}
+                }
+            }
+        }
+        _ => {
+            WARN!(
+                "Should not receive a stdin record as the request is in {} state",
+                rq.state
+            );
+        }
+    }
+    Ok(false)
+}
+
+fn fcgi_read_params<T: Read + Write>(
+    stream: &mut T,
+    rq: &mut FGCIRequest,
+    header: &FcgiHeader,
+) -> Result<(), std::io::Error> {
+    match &mut rq.state {
+        FCGIRequestState::WaitForParams => {
+            if header.length == 0 {
+                DEBUG!(
+                    "All param records read, now wait for stdin data on request: {}",
+                    header.id
+                );
+                // get the content length
+                if let Some(text) = rq.params.get("CONTENT_LENGTH") {
+                    if text.len() > 0 {
+                        rq.pending_dlen = text.parse::<isize>().map_err(|e| ERR!(e.to_string()))?;
+                    }
+                }
+                if let Some(text) = rq.params.get("CONTENT_TYPE") {
+                    // check if this is a multipart/form-data request
+                    if let Some(_) = text.find("multipart/form-data") {
+                        let split: Vec<&str> = text.split("boundary=").collect();
+                        if split.len() != 2 {
+                            return Err(ERR!("No boundary found in multipart/form-data body"));
+                        }
+                        DEBUG!("multipart/form-data boundary: {}", split[1].trim());
+                        let mut boundary = "--".to_owned();
+                        boundary.push_str(split[1].trim());
+                        rq.state = FCGIRequestState::WaitForStdin(
+                            FCGIRequestBodyState::FindBoundary(boundary),
+                        );
+                    } else {
+                        rq.state = FCGIRequestState::WaitForStdin(FCGIRequestBodyState::BinaryData);
+                    }
+                } else {
+                    return Err(ERR!("No content type header found in the request"));
+                }
+            } else {
+                fcgi_decode_params(rq, &fcgi_read_body(stream, &header)?)?;
+            }
+        }
+        __ => {
+            WARN!(
+                "Should not receive a param record as the request is in {} state",
+                rq.state
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn process_request<T: Read + Write + AsRawFd>(stream: &mut T) -> Result<(), std::io::Error> {
     let mut requests: HashMap<u16, FGCIRequest> = HashMap::new();
     loop {
         let header = fcgi_read_header(stream)?;
@@ -1105,7 +1273,7 @@ pub fn process_request<T: Read + Write + AsRawFd>(
                 DEBUG!("Begin Request: {:?}, with body {:?}", header, body);
                 if body.role != FCGIRole::Responder {
                     fcgi_send_end_request(stream, header.id, EndRequestStatus::UnknownRole)?;
-                    return Err(Box::new(ERR!("Only Responder role is supported")));
+                    return Err(ERR!("Only Responder role is supported"));
                 }
                 // check if we have already request of this kind
                 if let Some(_) = requests.get(&header.id) {
@@ -1117,78 +1285,30 @@ pub fn process_request<T: Read + Write + AsRawFd>(
                         data: None,
                         state: FCGIRequestState::WaitForParams,
                         fd: stream.as_raw_fd(),
+                        pending_dlen: 0,
                     };
                     requests.insert(header.id, rq);
                 }
             }
             FCGIHeaderType::Params => {
                 if let Some(rq) = requests.get_mut(&header.id) {
-                    match &rq.state {
-                        FCGIRequestState::WaitForParams => {
-                            if header.length == 0 {
-                                DEBUG!(
-                                    "All param records read, now wait for stdin data on request: {}",
-                                    header.id
-                                );
-                                rq.state = FCGIRequestState::WaitForStdin;
-                            } else {
-                                fcgi_decode_params(rq, &fcgi_read_body(stream, &header)?)?;
-                            }
-                        }
-                        __ => {
-                            WARN!(
-                                "Should not receive a param record as the request is in {} state",
-                                rq.state
-                            );
-                        }
-                    }
+                    fcgi_read_params(stream, rq, &header).map_err(|e| {
+                        let _ =
+                            fcgi_send_end_request(stream, header.id, EndRequestStatus::Complete);
+                        e
+                    })?;
                 } else {
                     WARN!("Uknown request {}, ignore param record", header.id);
                 }
             }
             FCGIHeaderType::Stdin => {
                 if let Some(rq) = requests.get_mut(&header.id) {
-                    match &rq.state {
-                        FCGIRequestState::WaitForStdin => {
-                            if header.length == 0 {
-                                DEBUG!(
-                                    "All stdin records read, now wait for stdout data on request: {}",
-                                    header.id
-                                );
-                                rq.state = FCGIRequestState::WaitForStdout;
-                                if let Err(error) = fcgi_execute_request_handle(rq) {
-                                    // send stderror
-                                    fcgi_send_stderr(stream, header.id, Some(error))?;
-                                }
-                                fcgi_send_stderr(stream, header.id, None)?;
-                                fcgi_send_stdout(stream, header.id, None)?;
-                                // send end connection
-                                fcgi_send_end_request(
-                                    stream,
-                                    header.id,
-                                    EndRequestStatus::Complete,
-                                )?;
-                                break;
-                            } else {
-                                let body = fcgi_read_body(stream, &header)?;
-                                if let None = rq.data {
-                                    rq.data = Some(Vec::new())
-                                }
-                                match rq.data.take() {
-                                    Some(mut data) => {
-                                        data.extend(body);
-                                        rq.data = Some(data);
-                                    }
-                                    None => {}
-                                }
-                            }
-                        }
-                        _ => {
-                            WARN!(
-                                "Should not receive a stdin record as the request is in {} state",
-                                rq.state
-                            );
-                        }
+                    if fcgi_read_stdin(stream, rq, &header).map_err(|e| {
+                        let _ =
+                            fcgi_send_end_request(stream, header.id, EndRequestStatus::Complete);
+                        e
+                    })? {
+                        break;
                     }
                 } else {
                     WARN!("Uknow request {}, ignore stdin record", header.id);
@@ -1204,6 +1324,173 @@ pub fn process_request<T: Read + Write + AsRawFd>(
         }
     }
     Ok(())
+}
+
+fn fcgi_decode_stdin_data(
+    state: &mut FCGIRequestBodyState,
+    buffer: &mut Vec<u8>,
+    params: &mut HashMap<String, String>,
+) -> Result<Option<FCGIRequestBodyState>, Error> {
+    match state {
+        FCGIRequestBodyState::FindBoundary(boundary) => {
+            let mut pattern = boundary.to_string();
+            pattern.push_str("\r\n");
+            if let Some(index) = twoway::find_bytes(buffer, pattern.as_bytes()) {
+                let _ = buffer.drain(0..index + pattern.len());
+                DEBUG!("Boundary found, decoding header");
+                return Ok(Some(FCGIRequestBodyState::HeaderDecoding(
+                    boundary.to_string(),
+                )));
+            }
+            Ok(None)
+        }
+        FCGIRequestBodyState::HeaderDecoding(boundary) => {
+            if let Some(end_index) = twoway::find_bytes(buffer, "\r\n\r\n".as_bytes()) {
+                let pattern = "Content-Disposition:";
+                if let Some(index) = twoway::find_bytes(&buffer[0..end_index], pattern.as_bytes()) {
+                    // got content-disposition, get the line
+                    let start_lime_index = index + pattern.len();
+                    let offset = twoway::find_bytes(
+                        &buffer[start_lime_index..end_index + 2],
+                        "\r\n".as_bytes(),
+                    )
+                    .ok_or(ERR!("Unknown ending of Content-Disposition line"))?;
+                    let line = String::from_utf8(
+                        buffer[start_lime_index..start_lime_index + offset].to_vec(),
+                    )
+                    .map_err(|e| ERR!(e.to_string()))?;
+                    DEBUG!("Content-Disposition: {}", line);
+                    // parsing content disposition for `name` and `file`
+                    // name is obliged, so find it first
+                    let mut name: Option<&str> = None;
+                    let mut fileopt: Option<&str> = None;
+
+                    for text in line.trim().split(";") {
+                        let trimmed = text.trim();
+                        if let Some(index) = trimmed.find("filename=") {
+                            fileopt = Some(&text[index + 11..trimmed.len()]);
+                            DEBUG!("Part filename = [{}]", fileopt.unwrap());
+                        } else if let Some(index) = trimmed.find("name=") {
+                            name = Some(&text[index + 7..trimmed.len()]);
+                            DEBUG!("Part name = [{}]", name.unwrap());
+                        } else {
+                            DEBUG!("Ignore part: {}", text);
+                        }
+                    }
+                    if let None = name {
+                        return Err(ERR!("No name attribut found in multi-part part"));
+                    }
+                    let mut file = None;
+                    if let Some(filename) = fileopt {
+                        let tmp_path = format!(
+                            "{}/{}.{}",
+                            TMP_DIR,
+                            filename,
+                            SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .map_err(|e| ERR!(e.to_string()))?
+                                .as_millis()
+                        );
+                        DEBUG!("Part will be saved to: {}", &tmp_path);
+                        file = Some(FCGIFilePart {
+                            name: filename.to_owned(),
+                            handle: std::fs::File::create(&tmp_path)?,
+                            tmp_path,
+                        });
+                    }
+                    let part_state = FCGIRequestBodyState::DataDecoding {
+                        boundary: boundary.to_string(),
+                        name: name.unwrap().to_owned(),
+                        file: file,
+                        vec: Vec::new(),
+                    };
+                    DEBUG!("Header decoding finished, go to data-decoding");
+                    let _ = buffer.drain(0..end_index + 4);
+                    return Ok(Some(part_state));
+                }
+                let _ = buffer.drain(0..end_index + 4);
+            }
+            Ok(None)
+        }
+        FCGIRequestBodyState::DataDecoding {
+            boundary,
+            name,
+            file,
+            vec,
+        } => {
+            loop {
+                match twoway::find_bytes(buffer, "\r\n".as_bytes()) {
+                    Some(index) => {
+                        let mut pattern_len = boundary.len();
+                        let mut content_data = &buffer[0..index + 2];
+                        let mut remaining = &buffer[index + 2..];
+                        if remaining.len() > pattern_len {
+                            //DEBUG!("content : {:?}", content_data);
+                            //DEBUG!("boundary: {:?}", boundary.as_bytes());
+                            //DEBUG!("remaining : {:?}", remaining);
+                            if remaining.starts_with(boundary.as_bytes()) {
+                                remaining = &remaining[pattern_len..];
+                                let state;
+                                if remaining.starts_with("\r\n".as_bytes()) {
+                                    state = Some(FCGIRequestBodyState::HeaderDecoding(
+                                        boundary.to_owned(),
+                                    ));
+                                    DEBUG!("Part Boundary end found, decoding next header");
+                                } else if remaining.starts_with("--".as_bytes()) {
+                                    pattern_len += 2;
+                                    state = Some(FCGIRequestBodyState::BinaryData);
+                                    DEBUG!("Request Boundary end found, finish stdin read");
+                                } else {
+                                    return Err(ERR!("Invalid boundary ending"));
+                                }
+                                // ignore or write to file
+                                content_data = &buffer[0..index];
+                                let value;
+                                if let Some(part) = file {
+                                    value = format!(
+                                        "{{\"file\":\"{}\",\"tmp\":\"{}\"}}",
+                                        part.name, part.tmp_path
+                                    );
+                                    part.handle.write_all(content_data)?;
+                                } else {
+                                    vec.extend(content_data);
+                                    // collect the data
+                                    value = String::from_utf8(vec.to_vec())
+                                        .map_err(|e| ERR!(e.to_string()))?;
+                                    DEBUG!("part data: {}", &value);
+                                }
+                                let _ = params.insert(format!("MULTIPART[{}]", name), value);
+                                let _ = buffer.drain(0..content_data.len() + pattern_len + 4);
+                                return Ok(state);
+                            } else {
+                                // ignore or write to file
+                                if let Some(part) = file {
+                                    part.handle.write_all(content_data)?;
+                                } else {
+                                    vec.extend(content_data);
+                                }
+                                let _ = buffer.drain(0..content_data.len());
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    None => {
+                        // ignore or write to file
+                        if let Some(part) = file {
+                            part.handle.write_all(buffer)?;
+                            buffer.clear();
+                        }
+                        break;
+                    }
+                }
+            }
+
+            Ok(None)
+        }
+        FCGIRequestBodyState::BinaryData => Ok(None),
+    }
+    //Ok(())
 }
 
 fn fcgi_read_header<T: Read + Write>(stream: &mut T) -> Result<FcgiHeader, Error> {
@@ -1234,10 +1521,7 @@ fn fcgi_decode_strlen(data: &[u8]) -> usize {
     }
 }
 
-fn fcgi_decode_params(
-    rq: &mut FGCIRequest,
-    data: &Vec<u8>,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn fcgi_decode_params(rq: &mut FGCIRequest, data: &Vec<u8>) -> Result<(), std::io::Error> {
     let mut index: usize = 1;
     let key_len = fcgi_decode_strlen(data);
     if key_len > 127 {
@@ -1253,9 +1537,11 @@ fn fcgi_decode_params(
     //INFO!("data: {:?}", data);
     //INFO!("key: {:?}", data[index..index + key_len].to_vec());
     //INFO!("Value: {:?}", data[index+key_len..index+key_len+value_len].to_vec());
-    let key = String::from_utf8(data[index..index + key_len].to_vec())?;
+    let key = String::from_utf8(data[index..index + key_len].to_vec())
+        .map_err(|e| ERR!(e.to_string()))?;
     let value: String =
-        String::from_utf8(data[index + key_len..index + key_len + value_len].to_vec())?;
+        String::from_utf8(data[index + key_len..index + key_len + value_len].to_vec())
+            .map_err(|e| ERR!(e.to_string()))?;
     DEBUG!("PARAM: [{}] -> [{}]", key, value);
     let _ = rq.params.insert(key, value);
     Ok(())

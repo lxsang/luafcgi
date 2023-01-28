@@ -157,14 +157,16 @@ fn main() {
         group: None,
         debug: false,
     };
+    if let Ok(val) = std::env::var("debug") {
+        if val == "1" || val == "true" {
+            config.debug = true;
+        }
+    }
     match matches.value_of("file") {
         Some(path) => {
             INFO!("Configuration file: {}", path);
             let contents = std::fs::read_to_string(path).unwrap();
             config = toml::from_str(&contents).unwrap();
-            if config.debug {
-                std::env::set_var("luad_debug", "true");
-            }
             // drop user privilege if only user and group available in
             // the configuration file, otherwise ignore
             privdrop(config.user.as_deref(), config.group.as_deref()).unwrap();
@@ -180,6 +182,10 @@ fn main() {
             }
         }
         None => {}
+    }
+    if config.debug {
+        INFO!("Debug enabled");
+        LOG::enable_debug();
     }
     serve(&config);
 }
