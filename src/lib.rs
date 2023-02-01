@@ -4,7 +4,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt::Arguments;
-use std::io::{BufRead, BufReader, Error, ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, Cursor, Error, ErrorKind, Read, Write};
 use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
 use std::time::SystemTime;
@@ -724,7 +724,18 @@ impl FCGIOStream {
     }
 
     fn write_record(&mut self, buf: Vec<u8>) -> Result<(), std::io::Error> {
-        fcgi_send_stdout(self, self.id, Some(buf))?;
+        let mut buf_reader = BufReader::with_capacity(2048, Cursor::new(buf));
+        loop {
+            let length = {
+                let buffer = buf_reader.fill_buf()?;
+                fcgi_send_stdout(self, self.id, Some(buffer.to_vec()))?;
+                buffer.len()
+            };
+            if length == 0 {
+                break;
+            }
+            buf_reader.consume(length);
+        }
         Ok(())
     }
 }

@@ -17,7 +17,7 @@ rand = "0.8.5"
 twoway = "0.2.2"
 
 [profile.release]
-opt-level = 's'
+opt-level = 3
 # 's' for size
 lto = true
 # panic = 'abort'
