@@ -30,7 +30,7 @@ def build_luad() {
 }
 
 pipeline {
-    agent { node { label'master' } }
+    agent { node { label'workstation' } }
     options {
         // Limit build history with buildDiscarder option:
         // daysToKeepStr: history is only kept up to this many days.
