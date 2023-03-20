@@ -49,42 +49,36 @@ pipeline {
     }
     stages
   {
-        stage('Prepare dependencies')
-    {
-            steps {
-                copyArtifacts(projectName: 'gitea-sync/ant-http/master', target: 'antd')
+    stage('Build AMD64') {
+        steps {
+            script {
+                env.arch = 'amd64'
             }
+            build_luad()
+        }
     }
-        stage('Build AMD64') {
-            steps {
-                script {
-                    env.arch = 'amd64'
-                }
-                build_luad()
+    stage('Build ARM64') {
+        steps {
+            script {
+                env.arch = 'arm64'
+            }
+            build_luad()
+        }
+    }
+    stage('Build ARM') {
+        steps {
+            script {
+                env.arch = 'arm'
+            }
+            build_luad()
+        }
+    }
+    stage('Archive') {
+        steps {
+            script {
+                archiveArtifacts artifacts: 'build/', fingerprint: true
             }
         }
-        stage('Build ARM64') {
-            steps {
-                script {
-                    env.arch = 'arm64'
-                }
-                build_luad()
-            }
-        }
-        stage('Build ARM') {
-            steps {
-                script {
-                    env.arch = 'arm'
-                }
-                build_luad()
-            }
-        }
-        stage('Archive') {
-            steps {
-                script {
-                    archiveArtifacts artifacts: 'build/', fingerprint: true
-                }
-            }
-        }
+    }
   }
 }
