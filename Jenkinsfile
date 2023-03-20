@@ -5,10 +5,27 @@ def build_luad() {
     export CARGO_HOME=/opt/rust/cargo
     . /opt/rust/cargo/env
     cd $WORKSPACE
+    TARGET=
+    case "$arch" in
+        amd64)
+            TARGET="x86_64-unknown-linux-gnu"
+            ;;
+        arm64)
+            TARGET="aarch64-unknown-linux-gnu"
+            ;;
+        arm)
+            TARGET="armv7-unknown-linux-gnueabihf"
+            ;;
+        *)
+            echo "unknown target for architecture $arch"
+            exit 1
+            ;;
+    esac
+    rustup target add $TARGET
     mkdir -p build/$arch/opt/www/bin
     DESTDIR=$WORKSPACE/build/$arch/opt/www/bin
-    cargo build --release
-    cp target/release/luad $DESTDIR
+    cargo build --target=$TARGET --release
+    cp target/$TARGET/release/luad $DESTDIR
   '''
 }
 
@@ -39,16 +56,6 @@ pipeline {
             }
     }
         stage('Build AMD64') {
-            agent {
-                docker {
-                    image 'xsangle/ci-tools:bionic-amd64'
-                    // Run the container on the node specified at the
-                    // top-level of the Pipeline, in the same workspace,
-                    // rather than on a new node entirely:
-                    reuseNode true
-                    registryUrl 'http://workstation:5000/'
-                }
-            }
             steps {
                 script {
                     env.arch = 'amd64'
@@ -57,16 +64,6 @@ pipeline {
             }
         }
         stage('Build ARM64') {
-            agent {
-                docker {
-                    image 'xsangle/ci-tools:bionic-arm64'
-                    // Run the container on the node specified at the
-                    // top-level of the Pipeline, in the same workspace,
-                    // rather than on a new node entirely:
-                    reuseNode true
-                    registryUrl 'http://workstation:5000/'
-                }
-            }
             steps {
                 script {
                     env.arch = 'arm64'
@@ -75,16 +72,6 @@ pipeline {
             }
         }
         stage('Build ARM') {
-            agent {
-                docker {
-                    image 'xsangle/ci-tools:bionic-arm'
-                    // Run the container on the node specified at the
-                    // top-level of the Pipeline, in the same workspace,
-                    // rather than on a new node entirely:
-                    reuseNode true
-                    registryUrl 'http://workstation:5000/'
-                }
-            }
             steps {
                 script {
                     env.arch = 'arm'
