@@ -728,7 +728,9 @@ impl FCGIOStream {
         loop {
             let length = {
                 let buffer = buf_reader.fill_buf()?;
-                fcgi_send_stdout(self, self.id, Some(buffer.to_vec()))?;
+                if buffer.len() > 0 {
+                    fcgi_send_stdout(self, self.id, Some(buffer.to_vec()))?;
+                }
                 buffer.len()
             };
             if length == 0 {
@@ -1532,29 +1534,35 @@ fn fcgi_decode_strlen(data: &[u8]) -> usize {
     }
 }
 
-fn fcgi_decode_params(rq: &mut FGCIRequest, data: &Vec<u8>) -> Result<(), std::io::Error> {
-    let mut index: usize = 1;
-    let key_len = fcgi_decode_strlen(data);
-    if key_len > 127 {
-        index = 4;
-    }
-    let value_len = fcgi_decode_strlen(&data[index..]);
-    //INFO!("Key len {}, value len {}", key_len, value_len);
-    if value_len > 127 {
-        index += 4;
-    } else {
-        index += 1;
-    }
-    //INFO!("data: {:?}", data);
-    //INFO!("key: {:?}", data[index..index + key_len].to_vec());
-    //INFO!("Value: {:?}", data[index+key_len..index+key_len+value_len].to_vec());
-    let key = String::from_utf8(data[index..index + key_len].to_vec())
-        .map_err(|e| ERR!(e.to_string()))?;
-    let value: String =
-        String::from_utf8(data[index + key_len..index + key_len + value_len].to_vec())
+fn fcgi_decode_params(rq: &mut FGCIRequest, vec: &Vec<u8>) -> Result<(), std::io::Error> {
+    let mut pos = 0;
+    while pos < vec.len() {
+        let data = &vec[pos..];
+        let mut index: usize = 1;
+        let key_len = fcgi_decode_strlen(data);
+        if key_len > 127 {
+            index = 4;
+        }
+        let value_len = fcgi_decode_strlen(&data[index..]);
+        //INFO!("Key len {}, value len {}", key_len, value_len);
+        if value_len > 127 {
+            index += 4;
+        } else {
+            index += 1;
+        }
+        //DEBUG!("data: {:?}", data);
+        //DEBUG!("key: {:?}", data[index..index + key_len].to_vec());
+        //DEBUG!("Value: {:?}", data[index+key_len..index+key_len+value_len].to_vec());
+        let key = String::from_utf8(data[index..index + key_len].to_vec())
             .map_err(|e| ERR!(e.to_string()))?;
-    DEBUG!("PARAM: [{}] -> [{}]", key, value);
-    let _ = rq.params.insert(key, value);
+        let value: String =
+            String::from_utf8(data[index + key_len..index + key_len + value_len].to_vec())
+                .map_err(|e| ERR!(e.to_string()))?;
+        DEBUG!("PARAM: [{}] -> [{}]", key, value);
+        pos = pos + index + key_len + value_len;
+
+        let _ = rq.params.insert(key, value);
+    }
     Ok(())
 }
 
